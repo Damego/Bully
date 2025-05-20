@@ -23,7 +23,7 @@ namespace Bully
         private int? port; // Текущий порт узла
         private List<Dictionary<string, int>> allNodes; // Список всех зарегистрированных узлов
         private TcpListener listener; // Слушатель подключений к узлу
-        private Thread listenerThread; // Поток для слушателя
+        private Thread connectionsReceiverThread; // Поток для слушателя
         private List<Node> connectedNodes = new(); // Список подключенных узлов. В конечном итоге должен совпадать со список зарегистрированных узлов
         private bool _continue = true; // Флаг на продолжение работы программы
         private int highestNodeId; // Самый старший возможный узел
@@ -71,7 +71,7 @@ namespace Bully
             return IP;
         }
 
-        private async Task ReceiveConnections()
+        private void ReceiveConnections()
         {
             while (_continue)
             {
@@ -224,7 +224,7 @@ namespace Bully
         private async Task ConnectToNode(int connectNodeId, int connectPort)
         {
             var ip = GetIPAddress();
-            
+
             var client = new TcpClient(ip.ToString(), connectPort);
             await SendMessage(client, $"HELLO;{(int)nodeId}");
         }
@@ -279,8 +279,8 @@ namespace Bully
                 MessageBox.Show(ex.Message);
                 return;
             }
-            listenerThread = new Thread(ReceiveConnections);
-            listenerThread.Start();
+            connectionsReceiverThread = new Thread(ReceiveConnections);
+            connectionsReceiverThread.Start();
 
             ConnectToAllNodes();
 
@@ -304,7 +304,6 @@ namespace Bully
 
             foreach (var node in connectedNodes)
             {
-                node.ReceiverTask.Dispose();
                 node.Client.Close();
             }
             if (coordinatorPingTask != null)
@@ -314,8 +313,8 @@ namespace Bully
 
             if (listener != null)
                 listener.Stop();
-            if (listenerThread != null)
-                listenerThread.Interrupt();
+            if (connectionsReceiverThread != null)
+                connectionsReceiverThread.Interrupt();
         }
 
         private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
