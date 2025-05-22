@@ -13,6 +13,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using System.Xml.Linq;
 using YamlDotNet.Serialization;
 
 namespace Bully
@@ -31,6 +32,7 @@ namespace Bully
         private Task coordinatorPingTask; // Таска на пинг координатора
         private bool ponged; // Флаг, означающий, был ли принято сообщение PONG от координатора
         private bool receivedOk; // Флаг, означающий, был ли принято сообщение OK хотя бы от одного узла
+        private List<UnregisteredConnection> unregisteredConnections = new(); // Незарегистрированные соединения. Ожидаем сообщения HELLO
 
         public MainForm()
         {
@@ -46,11 +48,6 @@ namespace Bully
             string nodesInfo = File.ReadAllText("./nodes.yaml");
             var deserializer = new DeserializerBuilder().Build();
             return deserializer.Deserialize<List<Dictionary<string, int>>>(nodesInfo);
-        }
-
-        private int GetNodeIdByPort(int port)
-        {
-            return allNodes.Find(node => node["port"] == port)["id"];
         }
 
         private int GetPortByNodeId(int nodeId)
@@ -79,69 +76,135 @@ namespace Bully
                 try
                 {
                     client = listener.AcceptTcpClient();
-                    // Приняли подключение и ожидаем сообщения HELLO с номером узла
+                    string unregid = Guid.NewGuid().ToString();
+
+                    // Приняли подключение и ожидаем сообщения HELLO с номером узла для регистрации подключения
+                    unregisteredConnections.Add(
+                        new UnregisteredConnection(
+                            unregid,
+                            client,
+                            Task.Factory.StartNew(() => ReceiveMessages(client.Client, unregisteredConnectionId: unregid))
+                        )
+                    );
                 }
                 catch (Exception ex)
                 {
-                    if (!_continue)
-                        return;
-                    continue;
                 }
             }
         }
 
-        private async Task ReceiveMessages(Socket socket)
+        private async Task ReceiveMessages(Socket socket, string unregisteredConnectionId)
         {
+            int? _nodeId = null; // Если соединение незарегистрированное, то id узла ещё нет 
+
             while (_continue)
             {
                 byte[] buff = new byte[1024];
-                await socket.ReceiveAsync(buff);
+                Debug.WriteLine("Awaiting a message");
+                try
+                {
+                    await socket.ReceiveAsync(buff);
+                }
+                catch (SocketException ex) {
+                    Debug.WriteLine($"Ошибка принятия сообщения: {ex.Message}");
+                    if (_nodeId != null)
+                    {
+                        DeleteNode((int)_nodeId);
+                        return;
+                    }
+                    return;
+                    // Exception thrown: 'System.Net.Sockets.SocketException' in System.Net.Sockets.dll
+                }
+                // пустая строка, а после Exception thrown: 'System.IndexOutOfRangeException' in Bully.dll
+                string rawMessage = Encoding.Unicode.GetString(buff);
+                Debug.WriteLine($"RAW {rawMessage}");
+                if (rawMessage.Length == 0)
+                {
+                    Debug.WriteLine($"Ошибка парсинга сообщения: `{rawMessage}`");
+                    DeleteNode((int)_nodeId);
+                    return;
+                }
+                // TODO: хуйня какаято я ебал
+                // 2 узел отбирает координатор у 3го, хз почему
+                string[] parts = rawMessage.Split(";");
+                string message = parts[0];
+                int nodeId = int.Parse(parts[1]);
+                _nodeId = nodeId;
 
-                string[] rawMessage = Encoding.Unicode.GetString(buff).Split(";");
-                string message = rawMessage[0];
-                int nodeId = int.Parse(rawMessage[1]);
-
-                await ProcessMessage(message, nodeId);
+                await ProcessMessage(message, nodeId, unregisteredConnectionId);
             }
         }
 
-        private async Task ProcessMessage(string message, int senderNodeId)
+        private async Task ProcessMessage(string message, int senderNodeId, string unregisteredConnectionId)
         {
             var senderNode = connectedNodes.Find(node => node.Id == senderNodeId);
 
+            if (senderNode == null && unregisteredConnectionId == null)
+            {
+                return;
+            }
+
+            AddStatusText(message, senderNodeId);
+
+            // Узел устроил выборы на роль координатора.
+            // Если текущий узел живой, то он принимает это сообщение и отправляет ОК и сам начинает выборы.
             if (message == "ELECTION")
             {
-                AddStatusText("Получено ELECTION", senderNodeId);
-                // Младшие узлы отправляют старшим сообщение ELECTION
-                // Если старший узел живой, то он отправляет ELECTION другим, более старшим узлам
-                await SendMessage(senderNode.Client, "OK");
+                await SendMessageToNode(senderNode, "OK");
                 await SendElectionMessage();
             }
+            // Узел получил сообщение ОК от старших узлов и больше не участвует в выборах
             else if (message == "OK")
             {
-                AddStatusText("Получено OK", senderNodeId);
                 receivedOk = true;
             }
+            // Один из узлов назначил себя координатором
             else if (message == "COORDINATOR")
             {
-                AddStatusText("Получено COORDINATOR", senderNodeId);
+                if (coordinatorPingTask != null)
+                {
+                    coordinatorPingTask.Dispose();
+                }
                 coordinatorNode = senderNode;
                 coordinatorPingTask = Task.Factory.StartNew(PingCoordinator);
             }
+            // Узел проверяет, что координатор живой
             else if (message == "PING")
             {
-                AddStatusText("Получено PING", senderNodeId);
-                await SendMessage(senderNode.Client, "PONG");
+                await SendMessageToNode(senderNode, "PONG");
             }
+            // Координатор ответил узлу, что он живой
             else if (message == "PONG")
             {
-                AddStatusText("Получено PONG", senderNodeId);
                 ponged = true;
             }
+            // Приветственное сообщение от узла, который подключается к текущему узлу.
+            // Оно необходимо, так как к TcpClient не привязывается порт удалённого узла и поэтому текущий узел не может
+            // распознать кто к нему подключился.
+            // В этом случае это подключение временно попадает в список незарегистрированных, а после принятия HELLO
+            // отправляется в список зарегистрированных узлов
             else if (message == "HELLO")
             {
-
+                RegisterConnection(unregisteredConnectionId, senderNodeId);
             }
+        }
+
+        private void RegisterConnection(string connectionId, int nodeId)
+        {
+            var connection = unregisteredConnections.Find(con => con.Id == connectionId);
+            unregisteredConnections.Remove(connection);
+            var node = connection.Register(nodeId);
+
+            // Узел переподключился
+            var existingNode = connectedNodes.Find(node =>  node.Id == nodeId);
+            if (existingNode != null)
+            {
+                existingNode.Stop();
+                existingNode.ReceiverTask = node.ReceiverTask;
+                existingNode.Client = node.Client;
+            }
+            else
+                AddNode(node);
         }
 
         /*
@@ -149,37 +212,68 @@ namespace Bully
         */
         private async Task SendElectionMessage()
         {
+            Debug.WriteLine("Отправка ELECTION");
             coordinatorNode = null;
             receivedOk = false;
+            if (coordinatorPingTask != null)
+            {
+                coordinatorPingTask.Dispose();
+                coordinatorPingTask = null;
+            }
+            
 
             foreach (var node in connectedNodes)
             {
-                if (node.Id > nodeId) continue;
-
-                await SendMessage(node.Client, "ELECTION");
+                if (node.Id < nodeId) continue;
+                await SendMessageToNode(node, "ELECTION");
             }
 
-            // Ожидаем в течение двух секунд ответа ОК хотя бы от одного узла. Если ответ не пришёл, то объявляем себя координатором
-            await Task.Delay(2000);
-            if (!receivedOk)
+            // Не блокируем асинхронный поток
+#pragma warning disable CS4014
+            Task.Factory.StartNew(async () =>
             {
-                receivedOk = false;
-                await SendCoordinatorMessage();
-            }
+                // Ожидаем в течение двух секунд ответа ОК хотя бы от одного узла. Если ответ не пришёл, то объявляем себя координатором
+                await Task.Delay(3000);
+                Debug.WriteLine("Прошло 3 сек. Отправка КООРДИНАТОР");
+                if (!receivedOk)
+                {
+                    receivedOk = false;
+                    await SendCoordinatorMessage();
+                }
+            });
+#pragma warning restore CS4014
         }
 
         private async Task SendCoordinatorMessage()
         {
+            if (coordinatorNode != null)
+            {
+                coordinatorPingTask.Dispose();
+                coordinatorNode = null;
+            }
+
             foreach (var node in connectedNodes)
             {
-                await SendMessage(node.Client, "COORDINATOR");
+                await SendMessageToNode(node, "COORDINATOR");
             }
         }
 
-        private async Task SendMessage(TcpClient client, string message)
+        private async Task SendMessageToNode(Node node, string message)
         {
-            byte[] buff = Encoding.Unicode.GetBytes(message);
-            await client.Client.SendAsync(buff);
+            Debug.WriteLine($"Connected count: {connectedNodes.Count}");
+            Debug.WriteLine($"Попытка отправки {message}:{node.Id}");
+            byte[] buff = Encoding.Unicode.GetBytes($"{message};{nodeId}");
+            try
+            {
+                await node.Client.Client.SendAsync(buff);
+                AddStatusText($"{message} -> {node.Id}");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Ошибка отправки {message}:{node.Id}");
+                // Узел перестал быть доступным. Удаляем его из списка зарегистрированных узлов.
+                DeleteNode(node);
+            }
         }
 
         /*
@@ -190,10 +284,15 @@ namespace Bully
         {
             while (true)
             {
+                if (coordinatorNode == null)
+                {
+                    Debug.WriteLine("Координатор не найден");
+                    return;
+                }
                 ponged = false;
-                await SendMessage(coordinatorNode.Client, "PING");
+                await SendMessageToNode(coordinatorNode, "PING");
 
-                await Task.Delay(2 * 1000);
+                await Task.Delay(4000);
                 if (!ponged)
                 {
                     await SendElectionMessage();
@@ -202,7 +301,7 @@ namespace Bully
             }
         }
 
-        private void ConnectToAllNodes()
+        private async Task ConnectToAllNodes()
         {
             foreach (var node in allNodes.Where(node => node["id"] != nodeId))
             {
@@ -210,30 +309,53 @@ namespace Bully
                 try
                 {
                     AddStatusText($"Попытка подключиться к {id}");
-                    ConnectToNode(node["id"], node["port"]);
+                    await ConnectToNode(node["id"], node["port"]);
                 }
                 catch (Exception ex)
                 {
                     AddStatusText($"Не удалось подключиться к {id}");
                     Debug.WriteLine(ex.Message);
-                    Thread.Sleep(100);
                 }
             }
         }
 
+        // Подключается к узлу и отправляет приветственное сообщение
         private async Task ConnectToNode(int connectNodeId, int connectPort)
         {
             var ip = GetIPAddress();
-
-            var client = new TcpClient(ip.ToString(), connectPort);
-            await SendMessage(client, $"HELLO;{(int)nodeId}");
+            var client = new TcpClient();
+            await client.ConnectAsync(ip.ToString(), connectPort);
+            var node = AddNode(connectNodeId, client);
+            await SendMessageToNode(node, "HELLO");
         }
 
-        private void AddNode(int nodeId, TcpClient client)
+        // Удаляет узел из памяти
+        private void DeleteNode(int nodeId)
         {
-            var receiverTask = Task.Factory.StartNew(() => ReceiveMessages(client.Client, nodeId));
+            var node = connectedNodes.Find(node => node.Id == nodeId);
+            if (node != null)
+                DeleteNode(node);
+        }
+
+        private void DeleteNode(Node node)
+        {
+            connectedNodes.Remove(node);
+            node.Stop();
+            Debug.WriteLine($"Удалён {node.Id}");
+        }
+
+        private Node AddNode(Node node)
+        {
+            connectedNodes.Add(node);
+            return node;
+        }
+
+        private Node AddNode(int nodeId, TcpClient client)
+        {
+            var receiverTask = Task.Factory.StartNew(() => ReceiveMessages(client.Client, null));
             var node = new Node(nodeId, client, receiverTask);
             connectedNodes.Add(node);
+            return node;
         }
 
         private void AddStatusText(string text)
@@ -248,17 +370,18 @@ namespace Bully
         {
             this.Invoke(new MethodInvoker(() =>
             {
-                statusTB.Text = $"{nodeId}: {text}\n{statusTB.Text}";
+                statusTB.Text = $"{nodeId} -> {text}\n{statusTB.Text}";
             }));
         }
 
-        private void connectBtn_Click(object sender, EventArgs e)
+        private async Task Connect()
         {
             if (nodeId != null)
             {
                 Disconnect();
 
-                this.Invoke(new MethodInvoker(() => {
+                this.Invoke(new MethodInvoker(() =>
+                {
                     connectBtn.Text = "Подключиться";
                     nodeTB.Enabled = true;
                 }));
@@ -268,6 +391,7 @@ namespace Bully
 
             nodeId = int.Parse(nodeTB.Text);
             port = GetPortByNodeId((int)nodeId);
+            _continue = true;
 
             try
             {
@@ -282,18 +406,24 @@ namespace Bully
             connectionsReceiverThread = new Thread(ReceiveConnections);
             connectionsReceiverThread.Start();
 
-            ConnectToAllNodes();
+            await ConnectToAllNodes();
 
             // Текущий узел является самым старшим среди всех остальных узлов, поэтому с чистой совестью он объявляет себя координатором
             if (nodeId == highestNodeId)
-                SendCoordinatorMessage();
+                await SendCoordinatorMessage();
             else
-                SendElectionMessage();
+                await SendElectionMessage();
 
-            this.Invoke(new MethodInvoker(() => {
+            this.Invoke(new MethodInvoker(() =>
+            {
                 connectBtn.Text = "Отключиться";
                 nodeTB.Enabled = false;
             }));
+        }
+
+        private void connectBtn_Click(object sender, EventArgs e)
+        {
+            Connect();
         }
 
         private void Disconnect()
@@ -306,15 +436,24 @@ namespace Bully
             {
                 node.Client.Close();
             }
+            connectedNodes.Clear();
             if (coordinatorPingTask != null)
             {
                 coordinatorPingTask.Dispose();
+                coordinatorPingTask = null;
             }
 
             if (listener != null)
+            {
                 listener.Stop();
+                listener = null;
+            }
             if (connectionsReceiverThread != null)
+            {
                 connectionsReceiverThread.Interrupt();
+                connectionsReceiverThread.Join();
+                connectionsReceiverThread = null;
+            }
         }
 
         private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
@@ -335,5 +474,32 @@ namespace Bully
             Client = client;
             ReceiverTask = receiverTask;
         }
+
+        public void Stop()
+        {
+            ReceiverTask.Dispose();
+            Client.Close();
+            Client.Dispose();
+        }
+    }
+
+    class UnregisteredConnection
+    {
+        public string Id { get; set; }
+        public TcpClient tcpClient { get; set; }
+        public Task ReceiverTask { get; set; }
+
+        public UnregisteredConnection(string id, TcpClient _tcpClient, Task receiverTask)
+        {
+            Id = id;
+            tcpClient = _tcpClient;
+            ReceiverTask = receiverTask;
+        }
+
+        public Node Register(int nodeId)
+        {
+            return new Node(nodeId, tcpClient, ReceiverTask);
+        }
+
     }
 }

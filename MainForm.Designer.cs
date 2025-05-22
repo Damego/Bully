@@ -68,10 +68,9 @@
             // 
             // statusTB
             // 
-            statusTB.Enabled = false;
             statusTB.Location = new System.Drawing.Point(133, 5);
             statusTB.Name = "statusTB";
-            statusTB.Size = new System.Drawing.Size(261, 140);
+            statusTB.Size = new System.Drawing.Size(330, 373);
             statusTB.TabIndex = 6;
             statusTB.Text = "";
             // 
@@ -79,7 +78,7 @@
             // 
             AutoScaleDimensions = new System.Drawing.SizeF(7F, 15F);
             AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            ClientSize = new System.Drawing.Size(397, 144);
+            ClientSize = new System.Drawing.Size(467, 380);
             Controls.Add(statusTB);
             Controls.Add(connectBtn);
             Controls.Add(label1);
